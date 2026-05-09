@@ -1,0 +1,293 @@
+trigger:
+  branches:
+    include: [main, release/*]
+  paths:
+    exclude: [docs/*, "*.md"]
+
+pr:
+  branches:
+    include: [main]
+
+variables:
+  - group: devsecops-global-secrets
+  - name: dockerRegistryServiceConnection
+    value: "acr-prod-connection"
+  - name: imageRepository
+    value: "$(Build.Repository.Name)"
+  - name: containerRegistry
+    value: "acrprod.azurecr.io"
+  - name: dockerfilePath
+    value: "$(Build.SourcesDirectory)/docker/Dockerfile.secure"
+  - name: tag
+    value: "$(Build.BuildId)"
+  - name: sonarProjectKey
+    value: "$(Build.Repository.Name)"
+
+stages:
+  # ─────────────────────────────────────────────
+  # Build e testes unitários
+  - stage: Build
+    displayName: "Build & Unit Test"
+    jobs:
+      - job: BuildAndTest
+        displayName: "Build, Test & Package"
+        pool:
+          vmImage: "ubuntu-22.04"
+        steps:
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: "3.11"
+            displayName: "Setup Python"
+
+          - script: |
+              python -m pip install --upgrade pip
+              pip install -r requirements.txt -r requirements-dev.txt
+            displayName: "Install dependencies"
+
+          - script: |
+              python -m pytest tests/unit \
+                --junitxml=$(Build.StagingDirectory)/test-results.xml \
+                --cov=src \
+                --cov-report=xml:$(Build.StagingDirectory)/coverage.xml \
+                --cov-report=html:$(Build.StagingDirectory)/htmlcov \
+                --cov-fail-under=80 \
+                -v
+            displayName: "Run unit tests"
+
+          - task: PublishTestResults@2
+            inputs:
+              testResultsFormat: JUnit
+              testResultsFiles: "$(Build.StagingDirectory)/test-results.xml"
+              failTaskOnFailedTests: true
+
+          - task: PublishCodeCoverageResults@2
+            inputs:
+              codeCoverageTool: Cobertura
+              summaryFileLocation: "$(Build.StagingDirectory)/coverage.xml"
+              failIfCoverageEmpty: true
+
+  # ─────────────────────────────────────────────
+  # Análise estática (SAST + SCA)
+  - stage: SAST
+    displayName: "Static Analysis (SAST + SCA)"
+    dependsOn: Build
+    jobs:
+      - job: SonarQube
+        displayName: "SonarQube SAST"
+        pool:
+          vmImage: "ubuntu-22.04"
+        steps:
+          - task: SonarQubePrepare@5
+            inputs:
+              SonarQube: "sonarqube-connection"
+              scannerMode: CLI
+              configMode: manual
+              cliProjectKey: $(sonarProjectKey)
+              extraProperties: |
+                sonar.python.coverage.reportPaths=$(Build.StagingDirectory)/coverage.xml
+                sonar.exclusions=**/tests/**,**/*.test.py
+                sonar.python.version=3.11
+
+          - task: SonarQubeAnalyze@5
+
+          - task: SonarQubePublish@5
+            inputs:
+              pollingTimeoutSec: "300"
+
+      - job: DependencyCheck
+        displayName: "OWASP Dependency Check (SCA)"
+        pool:
+          vmImage: "ubuntu-22.04"
+        steps:
+          - task: dependency-check-build-task@6
+            inputs:
+              projectName: "$(Build.Repository.Name)"
+              scanPath: "$(Build.SourcesDirectory)"
+              format: "HTML,SARIF,JSON"
+              failOnCVSS: "7"
+              suppressionPath: "security/dependency-check-suppressions.xml"
+            displayName: "OWASP Dependency Check"
+
+          - task: PublishBuildArtifacts@1
+            inputs:
+              pathToPublish: "$(Build.StagingDirectory)/dependency-check-report"
+              artifactName: "DependencyCheckReport"
+
+      - job: SecretScan
+        displayName: "Secret Detection (Gitleaks)"
+        pool:
+          vmImage: "ubuntu-22.04"
+        steps:
+          - script: |
+              curl -sSL https://github.com/gitleaks/gitleaks/releases/download/v8.18.2/gitleaks_8.18.2_linux_x64.tar.gz | tar xz
+              ./gitleaks detect \
+                --source . \
+                --report-format sarif \
+                --report-path gitleaks-report.sarif \
+                --exit-code 1
+            displayName: "Gitleaks secret scan"
+
+  # ─────────────────────────────────────────────
+  # Build e varredura do container
+  - stage: ContainerBuild
+    displayName: "Container Build & Scan"
+    dependsOn: SAST
+    jobs:
+      - job: BuildAndScan
+        displayName: "Build Image + Trivy Scan"
+        pool:
+          vmImage: "ubuntu-22.04"
+        steps:
+          - task: HadolintInstaller@1
+            displayName: "Install Hadolint"
+
+          - script: |
+              hadolint docker/Dockerfile.secure \
+                --format sarif > hadolint-report.sarif || true
+              hadolint docker/Dockerfile.secure \
+                --failure-threshold warning
+            displayName: "Hadolint Dockerfile lint"
+
+          - task: Docker@2
+            displayName: "Build container image"
+            inputs:
+              command: build
+              repository: $(imageRepository)
+              dockerfile: $(dockerfilePath)
+              containerRegistry: $(dockerRegistryServiceConnection)
+              tags: |
+                $(tag)
+                latest
+              arguments: "--no-cache --build-arg BUILD_DATE=$(Build.BuildId)"
+
+          - script: |
+              curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.49.1
+              trivy image \
+                --exit-code 1 \
+                --severity CRITICAL,HIGH \
+                --format sarif \
+                --output trivy-image-report.sarif \
+                $(containerRegistry)/$(imageRepository):$(tag)
+            displayName: "Trivy image vulnerability scan"
+
+          - task: Docker@2
+            displayName: "Push image to ACR"
+            condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+            inputs:
+              command: push
+              repository: $(imageRepository)
+              containerRegistry: $(dockerRegistryServiceConnection)
+              tags: |
+                $(tag)
+
+  # ─────────────────────────────────────────────
+  # Varredura de segurança em IaC
+  - stage: IaCScan
+    displayName: "IaC Security Scan"
+    dependsOn: Build
+    jobs:
+      - job: IaCSecurity
+        displayName: "Checkov + tfsec + OPA"
+        pool:
+          vmImage: "ubuntu-22.04"
+        steps:
+          - script: |
+              pip install checkov
+              checkov -d . \
+                --framework terraform,kubernetes,dockerfile,github_actions \
+                --compact \
+                --soft-fail-on MEDIUM \
+                --hard-fail-on HIGH,CRITICAL \
+                --output sarif \
+                --output-file checkov-report.sarif
+            displayName: "Checkov IaC scan"
+
+          - script: |
+              curl -s https://raw.githubusercontent.com/aquasecurity/tfsec/master/scripts/install_linux.sh | bash
+              tfsec . \
+                --format sarif \
+                --out tfsec-report.sarif \
+                --minimum-severity HIGH
+            displayName: "tfsec Terraform scan"
+
+  # ─────────────────────────────────────────────
+  # Deploy para o ambiente de desenvolvimento
+  - stage: DeployDev
+    displayName: "Deploy to Development"
+    dependsOn: [ContainerBuild, IaCScan]
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    jobs:
+      - deployment: DeployDev
+        displayName: "Deploy to AKS Dev"
+        environment: "development"
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - template: templates/deploy-template.yml
+                  parameters:
+                    environment: dev
+                    imageTag: $(tag)
+                    helmReleaseName: "$(imageRepository)-dev"
+                    k8sNamespace: "$(imageRepository)-dev"
+
+  # ─────────────────────────────────────────────
+  # Testes dinâmicos de segurança (DAST)
+  - stage: DAST
+    displayName: "Dynamic Security Testing (DAST)"
+    dependsOn: DeployDev
+    jobs:
+      - job: OWASP_ZAP
+        displayName: "OWASP ZAP DAST Scan"
+        pool:
+          vmImage: "ubuntu-22.04"
+        steps:
+          - script: |
+              docker pull ghcr.io/zaproxy/zaproxy:stable
+              docker run --rm \
+                -v $(Build.StagingDirectory):/zap/wrk/:rw \
+                ghcr.io/zaproxy/zaproxy:stable zap-api-scan.py \
+                -t $(DEV_API_URL)/openapi.json \
+                -f openapi \
+                -r zap-report.html \
+                -J zap-report.json \
+                -I \
+                -z "-config alert.maxInstances=0"
+            displayName: "OWASP ZAP API scan"
+
+          - task: PublishBuildArtifacts@1
+            inputs:
+              pathToPublish: "$(Build.StagingDirectory)/zap-report.html"
+              artifactName: "ZAPReport"
+
+  # ─────────────────────────────────────────────
+  # Deploy para produção
+  - stage: DeployProd
+    displayName: "Deploy to Production"
+    dependsOn: DAST
+    condition: succeeded()
+    jobs:
+      - deployment: DeployProd
+        displayName: "Deploy to AKS Production"
+        environment: "production"
+        strategy:
+          runOnce:
+            preDeploy:
+              steps:
+                - script: echo "Running pre-deploy checks..."
+            deploy:
+              steps:
+                - template: templates/deploy-template.yml
+                  parameters:
+                    environment: prod
+                    imageTag: $(tag)
+                    helmReleaseName: "$(imageRepository)"
+                    k8sNamespace: "$(imageRepository)"
+            routeTraffic:
+              steps:
+                - script: echo "Traffic routed successfully"
+            postRouteTraffic:
+              steps:
+                - script: |
+                    kubectl rollout status deployment/$(imageRepository) \
+                      -n $(imageRepository) --timeout=5m

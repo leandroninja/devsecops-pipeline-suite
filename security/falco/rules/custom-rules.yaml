@@ -1,0 +1,144 @@
+customRules:
+  custom-rules.yaml: |-
+
+    # ─────────────────────────────────────────────
+    # Detectar shell iniciado dentro de container
+    # ─────────────────────────────────────────────
+    - rule: Shell Spawned in Container
+      desc: Detects shell execution inside a running container (potential RCE or breakout)
+      condition: >
+        spawned_process
+        and container
+        and not container.image.repository in (allowed_shell_images)
+        and proc.name in (shell_binaries)
+      output: >
+        Shell spawned in container
+        (user=%user.name user_uid=%user.uid container_id=%container.id
+         container_name=%container.name image=%container.image.repository
+         shell=%proc.name parent=%proc.pname cmdline=%proc.cmdline)
+      priority: WARNING
+      tags: [container, shell, mitre_execution]
+
+    # ─────────────────────────────────────────────
+    # Detectar escalada de privilégio via sudo
+    # ─────────────────────────────────────────────
+    - rule: Sudo Execution in Container
+      desc: Detects use of sudo or su inside a container
+      condition: >
+        spawned_process
+        and container
+        and proc.name in (sudo_binaries)
+      output: >
+        Privilege escalation attempt via sudo/su
+        (user=%user.name container=%container.name image=%container.image.repository cmdline=%proc.cmdline)
+      priority: ERROR
+      tags: [container, privilege_escalation, mitre_privilege_escalation]
+
+    # ─────────────────────────────────────────────
+    # Detectar escrita em /etc dentro de container
+    # ─────────────────────────────────────────────
+    - rule: Write to /etc in Container
+      desc: File write to /etc inside a container indicates potential configuration tampering
+      condition: >
+        open_write
+        and container
+        and fd.name startswith /etc
+        and not proc.name in (allowed_etc_writers)
+      output: >
+        File written under /etc in container
+        (user=%user.name file=%fd.name container=%container.name image=%container.image.repository proc=%proc.name)
+      priority: WARNING
+      tags: [container, filesystem, mitre_persistence]
+
+    # ─────────────────────────────────────────────
+    # Detectar conexões de rede inesperadas
+    # ─────────────────────────────────────────────
+    - rule: Unexpected Outbound Connection from Container
+      desc: Container making unexpected outbound connection to internet
+      condition: >
+        outbound
+        and container
+        and not fd.sip.name in (allowed_outbound_destinations)
+        and not fd.sport in (allowed_outbound_ports)
+        and fd.is_server = false
+        and not proc.name in (known_network_processes)
+      output: >
+        Unexpected outbound connection from container
+        (user=%user.name container=%container.name image=%container.image.repository
+         connection=%fd.name proto=%fd.l4proto)
+      priority: NOTICE
+      tags: [container, network, mitre_command_and_control]
+
+    # ─────────────────────────────────────────────
+    # Detectar mineração de criptomoeda
+    # ─────────────────────────────────────────────
+    - rule: Crypto Mining Activity
+      desc: Detects execution of known crypto miners
+      condition: >
+        spawned_process
+        and container
+        and (
+          proc.name in (crypto_miners)
+          or (proc.cmdline contains "--pool" and proc.cmdline contains "--wallet")
+          or proc.cmdline contains "stratum+tcp"
+          or proc.cmdline contains "xmrig"
+        )
+      output: >
+        Potential crypto mining activity detected
+        (user=%user.name container=%container.name cmdline=%proc.cmdline image=%container.image.repository)
+      priority: CRITICAL
+      tags: [container, cryptomining, mitre_impact]
+
+    # ─────────────────────────────────────────────
+    # Detectar kubectl exec em pod
+    # ─────────────────────────────────────────────
+    - rule: K8s Exec Into Pod
+      desc: Detects someone exec-ing into a running pod
+      condition: >
+        ka.verb = "create"
+        and ka.target.subresource = "exec"
+        and ka.target.resource = "pods"
+        and not ka.user.name in (allowed_k8s_users)
+      output: >
+        Exec into pod by user %ka.user.name
+        (pod=%ka.target.name ns=%ka.target.namespace user=%ka.user.name container=%ka.req.pod.containers.image)
+      priority: WARNING
+      source: k8s_audit
+      tags: [k8s, exec, mitre_execution]
+
+    # ─────────────────────────────────────────────
+    # Listas / Macros
+    # ─────────────────────────────────────────────
+    - list: shell_binaries
+      items: [bash, sh, zsh, fish, ksh, tcsh]
+
+    - list: sudo_binaries
+      items: [sudo, su, doas]
+
+    - list: crypto_miners
+      items: [xmrig, minerd, cpuminer, cgminer, bfgminer, ethminer]
+
+    - list: allowed_shell_images
+      items: [toolbox, debug-container, kubectl-debug]
+
+    - list: allowed_etc_writers
+      items: [adduser, useradd, groupadd, passwd]
+
+    - list: allowed_k8s_users
+      items: [system:serviceaccount:kube-system:default]
+
+    - list: known_network_processes
+      items: [nginx, gunicorn, uvicorn, node, python, java]
+
+    - list: allowed_outbound_ports
+      items: [443, 80, 53]
+
+    - list: allowed_outbound_destinations
+      items: []
+
+    - macro: outbound
+      condition: >
+        (evt.type = connect and evt.dir = <)
+        and (fd.typechar = 4 or fd.typechar = 6)
+        and (fd.ip != "0.0.0.0" and fd.net != "127.0.0.0/8" and fd.net != "::1/128")
+        and (fd.sport != 0)
