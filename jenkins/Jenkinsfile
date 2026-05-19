@@ -1,0 +1,245 @@
+#!/usr/bin/env groovy
+
+pipeline {
+    agent {
+        kubernetes {
+            yaml '''
+apiVersion: v1
+kind: Pod
+spec:
+  containers:
+  - name: docker
+    image: docker:24.0-dind
+    securityContext:
+      privileged: true
+    volumeMounts:
+    - name: docker-sock
+      mountPath: /var/run/docker.sock
+  - name: tools
+    image: python:3.11-slim
+    command: ["sleep", "infinity"]
+    resources:
+      requests:
+        memory: "512Mi"
+        cpu: "500m"
+      limits:
+        memory: "1Gi"
+        cpu: "1"
+  volumes:
+  - name: docker-sock
+    hostPath:
+      path: /var/run/docker.sock
+'''
+        }
+    }
+
+    environment {
+        REGISTRY     = credentials('registry-url')
+        SONAR_TOKEN  = credentials('sonarqube-token')
+        VAULT_TOKEN  = credentials('vault-token')
+        IMAGE_TAG    = "${env.GIT_COMMIT[0..7]}"
+        IMAGE_NAME   = "${env.JOB_NAME.split('/')[0].toLowerCase()}"
+    }
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+        timeout(time: 60, unit: 'MINUTES')
+        skipDefaultCheckout(false)
+        disableConcurrentBuilds()
+        timestamps()
+    }
+
+    stages {
+        stage('Secret Scan') {
+            steps {
+                container('tools') {
+                    sh '''
+                        pip install detect-secrets -q
+                        detect-secrets scan . \
+                            --exclude-files ".git" \
+                            --baseline .secrets.baseline || true
+                        detect-secrets audit .secrets.baseline --report --json > secrets-report.json
+                        python3 -c "
+import json, sys
+with open('secrets-report.json') as f:
+    r = json.load(f)
+leaks = [x for x in r.get('results', {}).values() if not all(s['is_verified'] == False for s in x)]
+if leaks:
+    print('SECRETS DETECTED:', leaks)
+    sys.exit(1)
+print('No secrets detected')
+"
+                    '''
+                }
+            }
+        }
+
+        stage('Build & Test') {
+            parallel {
+                stage('Unit Tests') {
+                    steps {
+                        container('tools') {
+                            sh '''
+                                pip install -r requirements.txt -r requirements-dev.txt -q
+                                python -m pytest tests/unit \
+                                    --junitxml=test-results.xml \
+                                    --cov=src \
+                                    --cov-report=xml:coverage.xml \
+                                    --cov-fail-under=80 -q
+                            '''
+                            junit 'test-results.xml'
+                        }
+                    }
+                }
+
+                stage('Lint') {
+                    steps {
+                        container('tools') {
+                            sh '''
+                                pip install flake8 bandit pylint -q
+                                flake8 src/ --max-line-length=120 --statistics
+                                bandit -r src/ -ll -f json -o bandit-report.json || true
+                                python3 -c "
+import json, sys
+with open('bandit-report.json') as f:
+    r = json.load(f)
+highs = [i for i in r.get('results',[]) if i['issue_severity'] == 'HIGH']
+if highs:
+    print(f'{len(highs)} HIGH severity bandit findings')
+    sys.exit(1)
+"
+                            '''
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('SAST - SonarQube') {
+            steps {
+                container('tools') {
+                    sh '''
+                        pip install sonar-scanner -q || true
+                        curl -sSLo sonar-scanner.zip \
+                            https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-5.0.1.3006-linux.zip
+                        unzip -q sonar-scanner.zip
+                        ./sonar-scanner-5.0.1.3006-linux/bin/sonar-scanner \
+                            -Dsonar.projectKey=${IMAGE_NAME} \
+                            -Dsonar.sources=src \
+                            -Dsonar.python.coverage.reportPaths=coverage.xml \
+                            -Dsonar.host.url=${SONAR_URL} \
+                            -Dsonar.login=${SONAR_TOKEN} \
+                            -Dsonar.qualitygate.wait=true \
+                            -Dsonar.qualitygate.timeout=300
+                    '''
+                }
+            }
+        }
+
+        stage('Container Security') {
+            parallel {
+                stage('Build Image') {
+                    steps {
+                        container('docker') {
+                            sh """
+                                docker build \
+                                    --no-cache \
+                                    --build-arg BUILD_DATE=\$(date -u +%Y-%m-%dT%H:%M:%SZ) \
+                                    --build-arg GIT_COMMIT=${IMAGE_TAG} \
+                                    -t ${REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG} \
+                                    -f docker/Dockerfile.secure .
+                            """
+                        }
+                    }
+                }
+
+                stage('IaC Scan') {
+                    steps {
+                        container('tools') {
+                            sh '''
+                                pip install checkov -q
+                                checkov -d . \
+                                    --framework terraform,kubernetes \
+                                    --compact \
+                                    --hard-fail-on HIGH,CRITICAL \
+                                    --output cli
+                            '''
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Trivy Vulnerability Scan') {
+            steps {
+                container('docker') {
+                    sh """
+                        curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+                        trivy image \
+                            --exit-code 1 \
+                            --severity CRITICAL,HIGH \
+                            --format table \
+                            ${REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}
+                    """
+                }
+            }
+        }
+
+        stage('Push Image') {
+            when {
+                anyOf {
+                    branch 'main'
+                    branch 'release/*'
+                }
+            }
+            steps {
+                container('docker') {
+                    sh """
+                        docker push ${REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}
+                        docker tag ${REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG} \
+                                   ${REGISTRY}/${IMAGE_NAME}:latest
+                        docker push ${REGISTRY}/${IMAGE_NAME}:latest
+                    """
+                }
+            }
+        }
+
+        stage('Deploy Dev') {
+            when { branch 'main' }
+            steps {
+                container('tools') {
+                    sh """
+                        curl -LO https://dl.k8s.io/release/v1.29.0/bin/linux/amd64/kubectl
+                        chmod +x kubectl && mv kubectl /usr/local/bin/
+                        kubectl set image deployment/${IMAGE_NAME} \
+                            ${IMAGE_NAME}=${REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG} \
+                            -n ${IMAGE_NAME}-dev
+                        kubectl rollout status deployment/${IMAGE_NAME} \
+                            -n ${IMAGE_NAME}-dev --timeout=5m
+                    """
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            archiveArtifacts artifacts: '**/*-report.*, **/coverage.xml', allowEmptyArchive: true
+            cleanWs()
+        }
+        failure {
+            slackSend(
+                channel: '#ci-alerts',
+                color: 'danger',
+                message: "❌ Pipeline failed: ${env.JOB_NAME} #${env.BUILD_NUMBER}\n${env.BUILD_URL}"
+            )
+        }
+        success {
+            slackSend(
+                channel: '#ci-alerts',
+                color: 'good',
+                message: "✅ Pipeline passed: ${env.JOB_NAME} #${env.BUILD_NUMBER}\nImage: ${REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}"
+            )
+        }
+    }
+}
